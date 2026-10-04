@@ -13,6 +13,8 @@ const {
   decodeBase64Strict,
   InputError,
   HPACKError,
+  MODES,
+  DEFAULT_MODE,
   MAX_TOTAL_BYTES,
   MAX_CAPACITY,
   MAX_SEGMENTS,
@@ -49,10 +51,15 @@ function readBody(req) {
   });
 }
 
-function runDecode(capacityInput, rawSegments) {
+function runDecode(capacityInput, rawSegments, modeInput) {
   let capacity = capacityInput === undefined || capacityInput === null ? MAX_CAPACITY : capacityInput;
   if (!Number.isInteger(capacity) || capacity < 0 || capacity > MAX_CAPACITY) {
     throw new InputError('CAPACITY_INVALID', `动态表容量上限必须是 0..${MAX_CAPACITY} 之间的整数`);
+  }
+  // 缺省即“仅压缩复核”，保持旧请求体（无 mode 字段）的行为与结果不变
+  const mode = modeInput === undefined || modeInput === null ? DEFAULT_MODE : modeInput;
+  if (typeof mode !== 'string' || !MODES.includes(mode)) {
+    throw new InputError('MODE_INVALID', `复核模式必须是 ${MODES.join(' / ')} 之一`);
   }
   if (!Array.isArray(rawSegments) || rawSegments.length === 0 || rawSegments.length > MAX_SEGMENTS) {
     throw new InputError('SEGMENTS_INVALID', `需要 1..${MAX_SEGMENTS} 个 Base64 段`);
@@ -72,7 +79,7 @@ function runDecode(capacityInput, rawSegments) {
     throw new InputError('SEGMENTS_INVALID', '至少需要一个非空 Base64 段');
   }
 
-  const decoder = new SegmentedDecoder(capacity);
+  const decoder = new SegmentedDecoder(capacity, mode);
   const presentSlots = blocks
     .map((b, i) => ({ slot: i + 1, block: b }))
     .filter((x) => x.block !== null);
@@ -86,6 +93,7 @@ function runDecode(capacityInput, rawSegments) {
       if (e instanceof HPACKError) {
         return {
           ok: false,
+          mode,
           capacity,
           processedBytes: decoder.totalBytes,
           results: decoder.results,
@@ -113,6 +121,7 @@ function runDecode(capacityInput, rawSegments) {
   });
   return {
     ok: true,
+    mode,
     capacity,
     processedBytes: decoder.totalBytes,
     results: decoder.results,
@@ -136,7 +145,7 @@ async function handleApiDecode(req, res) {
   }
 
   try {
-    const out = runDecode(parsed.capacity, parsed.segments);
+    const out = runDecode(parsed.capacity, parsed.segments, parsed.mode);
     sendJson(res, out.ok ? 200 : 422, out);
   } catch (e) {
     if (e instanceof InputError) {
@@ -163,6 +172,8 @@ function createServer() {
         status: 'ok',
         service: 'hpack-relay-reviewer',
         limits: { maxCapacity: MAX_CAPACITY, maxTotalBytes: MAX_TOTAL_BYTES, maxSegments: MAX_SEGMENTS },
+        modes: MODES,
+        defaultMode: DEFAULT_MODE,
       });
       return;
     }

@@ -87,6 +87,14 @@ async function main() {
   check('含字段/来源/插入驱逐/快照渲染逻辑',
     /renderFields/.test(html) && /renderEvents/.test(html) && /renderSnapshot/.test(html));
   check('错误展示含块内字节偏移', /段内字节偏移/.test(html) && /offsetHex/.test(html));
+  check('含复核模式选择（仅压缩复核 / 严格请求头）',
+    /name="mode"/.test(html) && /value="compression"/.test(html) && /value="strict"/.test(html));
+  check('含严格请求头规则说明（伪首部顺序/恰一次/小写/连接专用/te）',
+    /伪首部先于普通字段/.test(html) && /UPPERCASE_HEADER|字段名全小写/.test(html) &&
+    /CONNECTION_HEADER|连接专用/.test(html) && /TE_INVALID|trailers/.test(html));
+  check('含严格模式示例与兼容对照示例',
+    /data-ex="strictok"/.test(html) && /data-ex="strictbad"/.test(html) && /data-ex="compat"/.test(html));
+  check('请求体会携带复核模式', /JSON\.stringify\(\{ capacity, mode, segments \}\)/.test(html));
   // 关键 JS 不能有明显语法错误：提取最后一个 <script> 块用 new Function 解析
   const scriptBody = html.slice(html.lastIndexOf('<script>') + 8, html.lastIndexOf('</' + 'script>'));
   let scriptOk = true;
@@ -166,7 +174,62 @@ async function main() {
       badJson.results.length === 1 && badJson.results[0].snapshot.entries.length === 1 &&
       badJson.results[0].snapshot.entries[0].name === 'x-telemetry-route');
 
-    // 3e. 截断整数错误定位 + 坏 Base64 / 坏容量的 400
+    // 3e. 严格请求头模式：有效请求 + 跨段引用
+    const strictOk = await request(base, 'POST', '/api/decode', {
+      capacity: 4096,
+      mode: 'strict',
+      segments: ['goaEQYzx48Ll8jproKuQ9P8=', 'goaEvg=='],
+    });
+    check('严格模式有效请求（含后块引用前块插入字段）→ 200',
+      strictOk.status === 200, `实际 ${strictOk.status}`);
+    const strictOkJson = JSON.parse(strictOk.raw);
+    check('严格模式回传 mode=strict 且两段均成功',
+      strictOkJson.ok === true && strictOkJson.mode === 'strict' &&
+      strictOkJson.conclusion && strictOkJson.conclusion.blocks === 2);
+    const strictSeg2 = strictOkJson.results && strictOkJson.results[1];
+    check('严格模式第二段引用段1插入的 :authority（动态 #62）',
+      !!strictSeg2 && strictSeg2.fields[3] && strictSeg2.fields[3].name === ':authority' &&
+      strictSeg2.fields[3].source.location === 'dynamic' && strictSeg2.fields[3].source.index === 62);
+
+    // 3f. 严格模式：伪首部顺序错误 -> 语义失败、精确块号/偏移/规则、整段回滚、无成功结论
+    const orderBad = ['goaEQYzx48Ll8jproKuQ9P8=', 'QAV4LXRtcAExgg=='];
+    const strictBad = await request(base, 'POST', '/api/decode', {
+      capacity: 4096, mode: 'strict', segments: orderBad,
+    });
+    check('严格模式伪首部顺序错误 → 422', strictBad.status === 422, `实际 ${strictBad.status}`);
+    const strictBadJson = JSON.parse(strictBad.raw);
+    check('语义失败定位：第 2 段 · 块内偏移 0x9 · PSEUDO_ORDER',
+      !strictBadJson.ok && strictBadJson.mode === 'strict' &&
+      strictBadJson.error.block === 2 && strictBadJson.error.offset === 9 &&
+      strictBadJson.error.offsetHex === '0x9' && strictBadJson.error.code === 'PSEUDO_ORDER');
+    check('语义失败不携带成功结论', strictBadJson.conclusion === null);
+    check('语义失败块不提交：段1 快照（:authority 插入）保留',
+      strictBadJson.results.length === 1 &&
+      strictBadJson.results[0].snapshot.entries.length === 1 &&
+      strictBadJson.results[0].snapshot.entries[0].name === ':authority');
+
+    // 3g. 仅压缩复核：同一字节链路仍成功（页面与接口两场景共用此口径）
+    const compat = await request(base, 'POST', '/api/decode', {
+      capacity: 4096, mode: 'compression', segments: orderBad,
+    });
+    check('仅压缩复核下同一链路 → 200 且两段成功',
+      compat.status === 200 && JSON.parse(compat.raw).ok === true &&
+      JSON.parse(compat.raw).conclusion.blocks === 2, `实际 ${compat.status}`);
+    // 缺省（不带 mode 字段）同样按仅压缩复核处理，旧调用方结果不变
+    const compatDefault = await request(base, 'POST', '/api/decode', {
+      capacity: 4096, segments: orderBad,
+    });
+    const compatDefaultJson = JSON.parse(compatDefault.raw);
+    check('缺省 mode 即仅压缩复核，回传 mode=compression、结论有效',
+      compatDefault.status === 200 && compatDefaultJson.ok === true &&
+      compatDefaultJson.mode === 'compression');
+    const badMode = await request(base, 'POST', '/api/decode', {
+      capacity: 4096, mode: 'nope', segments: ['vg=='],
+    });
+    check('非法 mode → 400 MODE_INVALID',
+      badMode.status === 400 && JSON.parse(badMode.raw).error.code === 'MODE_INVALID');
+
+    // 3h. 截断整数错误定位 + 坏 Base64 / 坏容量的 400
     const trunc = await request(base, 'POST', '/api/decode', { capacity: 4096, segments: ['P/8='] });
     // 0x3f 容量更新前缀满且无续字节 -> TRUNCATED_INTEGER at 0
     const truncJson = JSON.parse(trunc.raw);

@@ -2,12 +2,21 @@
 
 // 多段连续解码会话：段与段之间复用并“提交”同一张动态表。
 // 失败段在工作副本上抛错，绝不污染已提交状态；此前各段快照原样保留。
+//
+// 两种复核模式：
+//   compression（仅压缩复核，默认）——只裁决 HPACK (RFC 7541) 规则，
+//     保持任意合法 HPACK 字段链路的结果与快照不变；
+//   strict（严格请求头）——每块在压缩解码成功后，再按 HTTP/2 请求头规则
+//     （RFC 7540 §8.1.2）裁决字段序列；语义失败同样整体回滚该块。
 
 const { DynamicTable, decodeBlock, buildSnapshot, HPACKError } = require('./hpack');
+const { adjudicateRequestBlock } = require('./request-rules');
 
 const MAX_TOTAL_BYTES = 65536; // 全部段原始 HPACK 字节总量上限 64KiB
 const MAX_CAPACITY = 4096; // 动态表容量协商上限
 const MAX_SEGMENTS = 8;
+const MODES = ['compression', 'strict'];
+const DEFAULT_MODE = 'compression';
 
 class InputError extends Error {
   constructor(code, message) {
@@ -18,14 +27,18 @@ class InputError extends Error {
 }
 
 class SegmentedDecoder {
-  constructor(maxCapacity = MAX_CAPACITY) {
+  constructor(maxCapacity = MAX_CAPACITY, mode = DEFAULT_MODE) {
     if (!Number.isInteger(maxCapacity) || maxCapacity < 0 || maxCapacity > MAX_CAPACITY) {
       throw new InputError(
         'CAPACITY_INVALID',
         `动态表容量上限必须是 0..${MAX_CAPACITY} 之间的整数`
       );
     }
+    if (!MODES.includes(mode)) {
+      throw new InputError('MODE_INVALID', `复核模式必须是 ${MODES.join(' / ')} 之一`);
+    }
     this.maxCapacity = maxCapacity;
+    this.mode = mode;
     this.table = new DynamicTable(maxCapacity); // 已提交表状态
     this.results = []; // 仅含成功提交的段
     this.totalBytes = 0;
@@ -43,8 +56,12 @@ class SegmentedDecoder {
       );
     }
 
-    // 解码全程在工作副本上进行；只有完整成功才提交。
+    // 解码全程在工作副本上进行；只有完整成功（严格模式还含语义裁决）才提交。
     const { work, fields, events } = decodeBlock(raw, this.table, this.maxCapacity);
+    if (this.mode === 'strict') {
+      // 语义失败：不提交 work，块内插入/驱逐/容量变更随工作副本一并丢弃。
+      adjudicateRequestBlock(fields, raw.length);
+    }
     this.table = work;
     this.totalBytes += raw.length;
 
@@ -76,6 +93,7 @@ class SegmentedDecoder {
       }
     }
     return {
+      mode: this.mode,
       blocks: this.results.length,
       totalFields,
       totalBytes: this.totalBytes,
@@ -109,6 +127,8 @@ module.exports = {
   decodeBase64Strict,
   InputError,
   HPACKError,
+  MODES,
+  DEFAULT_MODE,
   MAX_TOTAL_BYTES,
   MAX_CAPACITY,
   MAX_SEGMENTS,

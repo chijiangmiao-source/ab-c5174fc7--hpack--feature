@@ -24,6 +24,17 @@
   label { display: block; font-size: 12.5px; color: var(--dim); margin: 10px 0 4px; }
   .cap-row { display: flex; gap: 12px; align-items: end; flex-wrap: wrap; }
   .cap-row .field { flex: 0 0 200px; }
+  .cap-row .mode-field { flex: 0 0 260px; }
+  .mode-box { display: flex; gap: 8px; }
+  .mode-box label {
+    flex: 1; margin: 0; display: flex; gap: 6px; align-items: center; cursor: pointer;
+    background: var(--panel2); border: 1px solid var(--line); border-radius: 7px;
+    padding: 8px 10px; font-size: 12.5px; color: var(--txt);
+  }
+  .mode-box label:has(input:checked) { border-color: var(--accent); background: #17223c; }
+  .mode-box input { margin: 0; }
+  .mode-box .txt { display: flex; flex-direction: column; line-height: 1.35; }
+  .mode-box .sub { color: var(--dim); font-size: 11px; }
   input[type=number], textarea {
     width: 100%; background: var(--panel2); color: var(--txt); border: 1px solid var(--line);
     border-radius: 7px; padding: 9px 10px; font-family: var(--mono); font-size: 12.5px;
@@ -89,6 +100,15 @@
         <label for="cap">动态表容量协商上限（字节，0–4096）</label>
         <input id="cap" type="number" min="0" max="4096" step="1" value="4096">
       </div>
+      <div class="mode-field">
+        <label>复核模式</label>
+        <div class="mode-box" id="modeBox">
+          <label><input type="radio" name="mode" value="compression" checked>
+            <span class="txt">仅压缩复核<span class="sub">只裁决 RFC 7541</span></span></label>
+          <label><input type="radio" name="mode" value="strict">
+            <span class="txt">严格请求头<span class="sub">叠加 RFC 7540 §8.1.2</span></span></label>
+        </div>
+      </div>
       <div class="examples">
         <label>快捷示例（载入后点“开始连续解码”）</label>
         <div class="btns" style="margin:0">
@@ -96,11 +116,17 @@
           <button type="button" data-ex="badtail">非法后续块（回滚验收）</button>
           <button type="button" data-ex="huff">Huffman · RFC C.4.1</button>
           <button type="button" data-ex="resize">块首容量更新与驱逐</button>
+          <button type="button" data-ex="strictok">严格请求 · 跨段引用</button>
+          <button type="button" data-ex="strictbad">严格模式 · 伪首部顺序错误回滚</button>
+          <button type="button" data-ex="compat">仅压缩复核 · 同链路仍成功</button>
         </div>
       </div>
     </div>
     <div class="seg-grid" id="segGrid" style="margin-top:12px"></div>
-    <div class="hint">仅接受标准 Base64（A–Z a–z 0–9 + / 与末尾 = 填充）；全部段原始 HPACK 字节合计不超过 64 KiB。</div>
+    <div class="hint">仅接受标准 Base64（A–Z a–z 0–9 + / 与末尾 = 填充）；全部段原始 HPACK 字节合计不超过 64 KiB。
+      “仅压缩复核”下任何合法 HPACK 字段链路均按原结果展示；“严格请求头”会额外按 HTTP/2 请求规则裁决每块：
+      伪首部先于普通字段、<span class="mono">:method/:scheme/:path</span> 各恰一次、字段名全小写、
+      拒绝连接专用字段及值不为 <span class="mono">trailers</span> 的 <span class="mono">te</span>。</div>
     <div class="btns">
       <button class="primary" id="btnDecode">开始连续解码</button>
       <button id="btnClearDraft">清空草稿</button>
@@ -132,18 +158,35 @@ for (let i = 1; i <= SEG_COUNT; i++) {
 
 const EXAMPLES = {
   // 段1 增量插入 x-telemetry-route: sat-a/tm/7（Huffman 值），段2 用动态索引 62 引用
-  cross: ['QBF4LXRlbGVtZXRyeS1yb3V0ZYdA0rDYTSw7', 'vg=='],
+  cross: { mode: 'compression', segs: ['QBF4LXRlbGVtZXRyeS1yb3V0ZYdA0rDYTSw7', 'vg=='] },
   // 段1 合法插入；段2 先插临时项 xx 再引用越界索引 64 -> 失败回滚，段1 快照保留
-  badtail: ['QBF4LXRlbGVtZXRyeS1yb3V0ZYdA0rDYTSw7', 'QAJ4eAF4wA=='],
-  huff: ['goaEQYzx48Ll8jproKuQ9P8='],
-  resize: ['P8UA', 'QAFBAUI='], // 段1 容量 100；段2 插入 A=B
+  badtail: { mode: 'compression', segs: ['QBF4LXRlbGVtZXRyeS1yb3V0ZYdA0rDYTSw7', 'QAJ4eAF4wA=='] },
+  huff: { mode: 'compression', segs: ['goaEQYzx48Ll8jproKuQ9P8='] },
+  resize: { mode: 'compression', segs: ['P8UA', 'QAFBAUI='] }, // 段1 容量 100；段2 插入 A=B
+  // 严格模式有效请求：段1 为 RFC C.4.1 首请求（插入 :authority），段2 引用动态 #62
+  strictok: { mode: 'strict', segs: ['goaEQYzx48Ll8jproKuQ9P8=', 'goaEvg=='] },
+  // 严格模式伪首部顺序错误：段2 先字面量 x-tmp: 1，再出现 :method -> 语义失败整段回滚
+  strictbad: { mode: 'strict', segs: ['goaEQYzx48Ll8jproKuQ9P8=', 'QAV4LXRtcAExgg=='] },
+  // 同一段“顺序错误”链路在仅压缩复核下仍成功（页面与接口两场景对照）
+  compat: { mode: 'compression', segs: ['goaEQYzx48Ll8jproKuQ9P8=', 'QAV4LXRtcAExgg=='] },
 };
+const MODE_LABEL = { compression: '仅压缩复核', strict: '严格请求头' };
+
+function currentMode() {
+  const picked = document.querySelector('input[name=mode]:checked');
+  return picked ? picked.value : 'compression';
+}
+function setMode(mode) {
+  const radio = document.querySelector('input[name=mode][value="' + mode + '"]');
+  if (radio) radio.checked = true;
+}
 
 document.querySelectorAll('[data-ex]').forEach((b) => {
   b.addEventListener('click', () => {
-    const ex = EXAMPLES[b.dataset.ex] || [];
-    for (let i = 1; i <= SEG_COUNT; i++) document.getElementById('seg' + i).value = ex[i - 1] || '';
-    document.getElementById('cap').value = b.dataset.ex === 'resize' ? '4096' : '4096';
+    const ex = EXAMPLES[b.dataset.ex] || { mode: 'compression', segs: [] };
+    for (let i = 1; i <= SEG_COUNT; i++) document.getElementById('seg' + i).value = ex.segs[i - 1] || '';
+    document.getElementById('cap').value = '4096';
+    setMode(ex.mode);
     clearResults();
   });
 });
@@ -247,11 +290,12 @@ document.getElementById('btnDecode').addEventListener('click', async () => {
   const segments = [];
   for (let i = 1; i <= SEG_COUNT; i++) segments.push(document.getElementById('seg' + i).value.trim());
   const capacity = Number(document.getElementById('cap').value);
+  const mode = currentMode();
   let resp;
   try {
     resp = await fetch('/api/decode', {
       method: 'POST', headers: { 'content-type': 'application/json' },
-      body: JSON.stringify({ capacity, segments }),
+      body: JSON.stringify({ capacity, mode, segments }),
     });
   } catch (e) {
     $status.innerHTML = '<div class="alert err">网络错误：无法连接解码服务（' + esc(e.message) + '）</div>';
@@ -266,28 +310,37 @@ document.getElementById('btnDecode').addEventListener('click', async () => {
 
   if (!data.ok) {
     const e = data.error;
+    const semantic = ['PSEUDO_ORDER', 'PSEUDO_DUPLICATE', 'PSEUDO_UNKNOWN', 'PSEUDO_MISSING',
+      'UPPERCASE_HEADER', 'CONNECTION_HEADER', 'TE_INVALID'].includes(e.code);
     // 验收要求：失败即清除“成功结论”
-    $status.innerHTML = '<div class="alert err">⛔ <b>第 ' + e.block + ' 段解码失败</b>，已在段内字节偏移 ' +
+    $status.innerHTML = '<div class="alert err">⛔ <b>第 ' + e.block + ' 段解码失败</b>' +
+      '（' + MODE_LABEL[mode] + (semantic ? ' · 请求头语义裁决' : ' · HPACK 压缩规则') + '），' +
+      '已在段内字节偏移 ' +
       '<span class="off">' + e.offsetHex + '（十进制 ' + e.offset + '）</span>' +
       (e.byte ? '，该字节 <span class="off">' + e.byte + '</span>' : '') +
       ' 处检出 <span class="code">' + esc(e.code) + '</span>：' + esc(e.message) +
-      '<div class="hint" style="color:#e6b3b3;margin-top:6px">该失败块<b>未提交</b>：此前各段快照原样保留，块内插入/驱逐已全部回滚；不生成成功结论。</div></div>';
+      '<div class="hint" style="color:#e6b3b3;margin-top:6px">该失败块<b>未提交</b>：此前各段快照原样保留，块内插入/驱逐/容量变更已全部回滚；不生成成功结论。</div></div>';
     data.results.forEach((r) => $blocks.appendChild(renderBlock(r, false)));
     $blocks.appendChild(renderBlock({ block: e.block, rawLength: e.blockLength, fields: null, events: null, snapshot: null }, true));
     return;
   }
 
   const c = data.conclusion;
-  $status.innerHTML = '<div class="alert ok">✅ 全部 ' + data.results.length + ' 段连续解码成功，压缩上下文跨段一致，结论有效。</div>';
+  const strictOk = data.mode === 'strict';
+  $status.innerHTML = '<div class="alert ok">✅ 全部 ' + data.results.length + ' 段连续解码成功' +
+    (strictOk ? '，且每块均通过 HTTP/2 请求头规则裁决' : '') +
+    '，压缩上下文跨段一致，结论有效（' + MODE_LABEL[data.mode] + '）。</div>';
   let rows = c.allFields.map((f) =>
     '<tr><td>第 ' + f.block + ' 段</td><td class="mono">0x' + f.offset.toString(16) +
     '</td><td class="mono">' + esc(f.name) + '</td><td class="mono">' + esc(f.value) + '</td></tr>').join('');
   if (!rows) rows = '<tr><td colspan="4" class="empty">所有段均为空块，无还原字段</td></tr>';
-  $concl.innerHTML = '<section class="panel"><h2>② 成功结论（全部段字段按接收顺序还原）</h2>' +
+  $concl.innerHTML = '<section class="panel"><h2>② 成功结论（全部段字段按接收顺序还原 · ' +
+    MODE_LABEL[data.mode] + '）</h2>' +
     '<div class="concl-grid"><span>成功段数：<b>' + c.blocks + '</b></span>' +
     '<span>字段总数：<b>' + c.totalFields + '</b></span>' +
     '<span>原始字节：<b>' + c.totalBytes + '</b> / 65536</span>' +
-    '<span>表终态占用：<b>' + c.finalSnapshot.size + '</b> / ' + c.finalSnapshot.maxSize + ' B</span></div>' +
+    '<span>表终态占用：<b>' + c.finalSnapshot.size + '</b> / ' + c.finalSnapshot.maxSize + ' B</span>' +
+    (strictOk ? '<span>请求头裁决：<b>每块通过</b></span>' : '') + '</div>' +
     '<table><thead><tr><th>所属段</th><th>段内偏移</th><th>字段名</th><th>字段值</th></tr></thead><tbody>' +
     rows + '</tbody></table></section>';
   data.results.forEach((r) => $blocks.appendChild(renderBlock(r, false)));

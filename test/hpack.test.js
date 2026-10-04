@@ -18,6 +18,7 @@ const {
   MAX_CAPACITY,
   MAX_TOTAL_BYTES,
 } = require('../src/engine/session');
+const { adjudicateRequestBlock } = require('../src/engine/request-rules');
 const { CODES } = require('../src/engine/huffman-table');
 
 const hex = (s) => Buffer.from(s.replace(/\s+/g, ''), 'hex');
@@ -433,4 +434,162 @@ test('Huffman：空 Huffman 串合法（编码后 0 字节）', () => {
   const r = decodeBlock(hex('00 80 80'), table, 4096);
   assert.equal(r.fields[0].name, '');
   assert.equal(r.fields[0].value, '');
+});
+
+// --- 严格请求头模式：裁决器直接单测 ----------------------------------------------
+function field(name, value, offset = 0) {
+  return { name, value, offset };
+}
+
+test('严格裁决：合法请求字段序列通过（伪首部先于普通字段、te: trailers 放行）', () => {
+  assert.doesNotThrow(() => adjudicateRequestBlock([
+    field(':method', 'GET', 0),
+    field(':scheme', 'https', 1),
+    field(':path', '/a', 2),
+    field(':authority', 'host', 3),
+    field('te', 'trailers', 4),
+    field('x-telemetry-route', 'sat-a/tm/7', 5),
+  ], 6));
+});
+
+test('严格裁决：普通字段之后出现伪首部 -> PSEUDO_ORDER，偏移指向违规字段', () => {
+  try {
+    adjudicateRequestBlock([
+      field(':method', 'GET', 0),
+      field(':scheme', 'http', 1),
+      field(':path', '/', 2),
+      field('x-tmp', '1', 3),
+      field(':method', 'POST', 9),
+    ], 10);
+    assert.fail('应当抛错');
+  } catch (e) {
+    assert.equal(e.code, 'PSEUDO_ORDER');
+    assert.equal(e.offset, 9);
+  }
+});
+
+test('严格裁决：:method/:scheme/:path 重复与缺失分别报 PSEUDO_DUPLICATE/PSEUDO_MISSING', () => {
+  expectError(() => adjudicateRequestBlock([
+    field(':method', 'GET', 0), field(':method', 'POST', 1),
+    field(':scheme', 'http', 2), field(':path', '/', 3),
+  ], 4), 'PSEUDO_DUPLICATE');
+  try {
+    adjudicateRequestBlock([field(':method', 'GET', 0), field(':scheme', 'http', 1)], 2);
+    assert.fail('应当抛错');
+  } catch (e) {
+    assert.equal(e.code, 'PSEUDO_MISSING');
+    assert.equal(e.offset, 2); // 定位到块尾
+  }
+});
+
+test('严格裁决：请求块拒绝 :status、大写字段名、连接专用字段与非法 te', () => {
+  const base = [field(':method', 'GET', 0), field(':scheme', 'http', 1), field(':path', '/', 2)];
+  expectError(() => adjudicateRequestBlock([...base, field(':status', '200', 3)], 4), 'PSEUDO_UNKNOWN');
+  expectError(() => adjudicateRequestBlock([...base, field('X-Telemetry', 'x', 3)], 4), 'UPPERCASE_HEADER');
+  for (const name of ['connection', 'keep-alive', 'proxy-connection', 'transfer-encoding', 'upgrade']) {
+    expectError(() => adjudicateRequestBlock([...base, field(name, 'x', 3)], 4), 'CONNECTION_HEADER');
+  }
+  expectError(() => adjudicateRequestBlock([...base, field('te', 'gzip', 3)], 4), 'TE_INVALID');
+});
+
+// --- 严格请求头模式：会话级行为 ---------------------------------------------------
+// 构造“字面量 name: value（带增量索引）”HPACK 字节
+function litIncremental(name, value) {
+  const nb = Buffer.from(name, 'utf8');
+  const vb = Buffer.from(value, 'utf8');
+  return Buffer.concat([Buffer.from([0x40, nb.length]), nb, Buffer.from([vb.length]), vb]);
+}
+const REQUEST_PREFIX = hex('82 86 84'); // :method GET / :scheme http / :path /
+const C41_FIRST = hex('8286 8441 8cf1 e3c2 e5f2 3a6b a0ab 90f4 ff'); // RFC C.4.1 首请求
+
+test('严格模式：合法 RFC C.4.1 请求块通过并提交 :authority 插入', () => {
+  const sd = new SegmentedDecoder(4096, 'strict');
+  const r = sd.addBlock(C41_FIRST);
+  assert.equal(r.fields.length, 4);
+  assert.equal(sd.table.entries.length, 1);
+  assert.equal(sd.table.entries[0].name, ':authority');
+});
+
+test('严格模式：后块引用前块插入字段仍可通过', () => {
+  const sd = new SegmentedDecoder(4096, 'strict');
+  sd.addBlock(C41_FIRST); // 插入 :authority -> 动态表 #62
+  const r2 = sd.addBlock(Buffer.concat([REQUEST_PREFIX, Buffer.from([0xbe])])); // 引用 #62
+  assert.equal(r2.fields[3].name, ':authority');
+  assert.equal(r2.fields[3].source.location, 'dynamic');
+  assert.equal(sd.conclusion().blocks, 2);
+});
+
+test('严格模式：伪首部顺序错误的块整体回滚，此前快照与成功结论保留', () => {
+  const sd = new SegmentedDecoder(4096, 'strict');
+  sd.addBlock(C41_FIRST); // 提交 :authority
+  const before = JSON.stringify(buildSnapshot(sd.table));
+
+  // 块2：先普通字段（增量插入 x-tmp），再出 :method 索引 0x82 -> 语义失败
+  const bad = Buffer.concat([litIncremental('x-tmp', '1'), Buffer.from([0x82, 0x86, 0x84])]);
+  try {
+    sd.addBlock(bad);
+    assert.fail('应当抛错');
+  } catch (e) {
+    assert.equal(e.code, 'PSEUDO_ORDER');
+    // 首个违规字段 :method 的起始偏移 = 块内 x-tmp 条目之后
+    assert.equal(e.offset, litIncremental('x-tmp', '1').length);
+  }
+
+  // 块内插入（x-tmp）不得提交，表恢复为段1 提交后的状态
+  assert.equal(JSON.stringify(buildSnapshot(sd.table)), before);
+  assert.equal(sd.results.length, 1);
+  // 旧成功结论仍可读取（新失败响应不携带结论；此处验证已提交段未被清除）
+  assert.equal(sd.conclusion().blocks, 1);
+
+  // 回滚后再来一个合法严格请求块，仍能引用段1 插入的 :authority
+  const r3 = sd.addBlock(Buffer.concat([REQUEST_PREFIX, Buffer.from([0xbe])]));
+  assert.equal(r3.fields[3].source.index, 62);
+});
+
+test('严格模式：块首容量变更后语义失败，容量变更同样回滚', () => {
+  const sd = new SegmentedDecoder(4096, 'strict');
+  sd.addBlock(C41_FIRST);
+  const limitBefore = sd.table.sizeLimit;
+  // 容量置 100（3f c5 00），随后给出缺少 :path 的不完整请求 -> PSEUDO_MISSING
+  assert.throws(() => sd.addBlock(hex('3f c5 00 82 86')), (e) => e.code === 'PSEUDO_MISSING');
+  assert.equal(sd.table.sizeLimit, limitBefore);
+  assert.equal(sd.results.length, 1);
+});
+
+test('严格模式：大写字段名/连接专用字段/非法 te/重复伪首部均判块失败并回滚', () => {
+  const cases = [
+    Buffer.concat([REQUEST_PREFIX, litIncremental('X-Tmp', '1')]),
+    Buffer.concat([REQUEST_PREFIX, litIncremental('connection', 'keep-alive')]),
+    Buffer.concat([REQUEST_PREFIX, litIncremental('te', 'gzip')]),
+    Buffer.concat([REQUEST_PREFIX, Buffer.from([0x82])]), // :method 重复
+  ];
+  const codes = ['UPPERCASE_HEADER', 'CONNECTION_HEADER', 'TE_INVALID', 'PSEUDO_DUPLICATE'];
+  cases.forEach((block, i) => {
+    const sd = new SegmentedDecoder(4096, 'strict');
+    sd.addBlock(C41_FIRST);
+    assert.throws(() => sd.addBlock(block), (e) => e.code === codes[i]);
+    assert.equal(sd.results.length, 1, '语义失败块不得提交');
+    assert.equal(sd.table.entries.length, 1, '块内插入必须回滚');
+  });
+});
+
+test('仅压缩复核：严格模式判失败的同字节链路仍成功，结果与快照不变', () => {
+  const sd = new SegmentedDecoder(4096, 'compression');
+  sd.addBlock(C41_FIRST);
+  // 普通字段在前、伪首部在后：压缩层完全合法
+  const mixed = Buffer.concat([litIncremental('x-tmp', '1'), Buffer.from([0x82, 0x86, 0x84])]);
+  const r2 = sd.addBlock(mixed);
+  assert.equal(r2.fields.length, 4);
+  assert.equal(sd.conclusion().blocks, 2);
+  // 连接专用字段 / 大写名 / 非法 te 在仅压缩复核下也不阻断
+  const sd2 = new SegmentedDecoder(4096, 'compression');
+  assert.doesNotThrow(() => sd2.addBlock(
+    Buffer.concat([REQUEST_PREFIX, litIncremental('Te', 'gzip'), litIncremental('connection', 'x')])
+  ));
+});
+
+test('模式选择：缺省为 compression，非法模式被拒绝', () => {
+  assert.equal(new SegmentedDecoder(4096).mode, 'compression');
+  assert.equal(new SegmentedDecoder(4096, 'strict').mode, 'strict');
+  assert.throws(() => new SegmentedDecoder(4096, 'verbose'), (e) => e.code === 'MODE_INVALID');
 });
