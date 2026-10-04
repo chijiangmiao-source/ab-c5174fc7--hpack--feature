@@ -24,10 +24,11 @@
   label { display: block; font-size: 12.5px; color: var(--dim); margin: 10px 0 4px; }
   .cap-row { display: flex; gap: 12px; align-items: end; flex-wrap: wrap; }
   .cap-row .field { flex: 0 0 200px; }
-  input[type=number], textarea {
+  input[type=number], select, textarea {
     width: 100%; background: var(--panel2); color: var(--txt); border: 1px solid var(--line);
     border-radius: 7px; padding: 9px 10px; font-family: var(--mono); font-size: 12.5px;
   }
+  select { appearance: none; cursor: pointer; }
   textarea { resize: vertical; min-height: 58px; word-break: break-all; }
   input:focus, textarea:focus { outline: none; border-color: var(--accent); }
   .seg-grid { display: grid; grid-template-columns: repeat(2, 1fr); gap: 12px; }
@@ -89,6 +90,13 @@
         <label for="cap">动态表容量协商上限（字节，0–4096）</label>
         <input id="cap" type="number" min="0" max="4096" step="1" value="4096">
       </div>
+      <div class="field" style="flex:0 0 300px">
+        <label for="mode">复核模式</label>
+        <select id="mode">
+          <option value="compression" selected>仅压缩复核（任意合法 HPACK 字段链路）</option>
+          <option value="strict">严格请求头（HTTP/2 请求头规则裁决）</option>
+        </select>
+      </div>
       <div class="examples">
         <label>快捷示例（载入后点“开始连续解码”）</label>
         <div class="btns" style="margin:0">
@@ -96,6 +104,8 @@
           <button type="button" data-ex="badtail">非法后续块（回滚验收）</button>
           <button type="button" data-ex="huff">Huffman · RFC C.4.1</button>
           <button type="button" data-ex="resize">块首容量更新与驱逐</button>
+          <button type="button" data-ex="strictok">严格 · 合法请求跨段引用</button>
+          <button type="button" data-ex="strictbad">严格 · 伪首部顺序错误回滚</button>
         </div>
       </div>
     </div>
@@ -132,18 +142,29 @@ for (let i = 1; i <= SEG_COUNT; i++) {
 
 const EXAMPLES = {
   // 段1 增量插入 x-telemetry-route: sat-a/tm/7（Huffman 值），段2 用动态索引 62 引用
-  cross: ['QBF4LXRlbGVtZXRyeS1yb3V0ZYdA0rDYTSw7', 'vg=='],
+  cross: { mode: 'compression', segs: ['QBF4LXRlbGVtZXRyeS1yb3V0ZYdA0rDYTSw7', 'vg=='] },
   // 段1 合法插入；段2 先插临时项 xx 再引用越界索引 64 -> 失败回滚，段1 快照保留
-  badtail: ['QBF4LXRlbGVtZXRyeS1yb3V0ZYdA0rDYTSw7', 'QAJ4eAF4wA=='],
-  huff: ['goaEQYzx48Ll8jproKuQ9P8='],
-  resize: ['P8UA', 'QAFBAUI='], // 段1 容量 100；段2 插入 A=B
+  badtail: { mode: 'compression', segs: ['QBF4LXRlbGVtZXRyeS1yb3V0ZYdA0rDYTSw7', 'QAJ4eAF4wA=='] },
+  huff: { mode: 'compression', segs: ['goaEQYzx48Ll8jproKuQ9P8='] },
+  resize: { mode: 'compression', segs: ['P8UA', 'QAFBAUI='] }, // 段1 容量 100；段2 插入 A=B
+  // 严格模式：段1 合法请求（三伪首部 + 增量插入遥测路由），段2 自带三伪首部并用动态索引 62 引用前块插入项
+  strictok: {
+    mode: 'strict',
+    segs: ['goaEQBF4LXRlbGVtZXRyeS1yb3V0ZQpzYXQtYS90bS83', 'goaEvg=='],
+  },
+  // 严格模式：段1 合法请求；段2 先插入 foo=bar（普通字段）再出现 :method -> 伪首部顺序错误，整段回滚
+  strictbad: {
+    mode: 'strict',
+    segs: ['goaEQBF4LXRlbGVtZXRyeS1yb3V0ZQpzYXQtYS90bS83', 'QANmb28DYmFygg=='],
+  },
 };
 
 document.querySelectorAll('[data-ex]').forEach((b) => {
   b.addEventListener('click', () => {
-    const ex = EXAMPLES[b.dataset.ex] || [];
-    for (let i = 1; i <= SEG_COUNT; i++) document.getElementById('seg' + i).value = ex[i - 1] || '';
-    document.getElementById('cap').value = b.dataset.ex === 'resize' ? '4096' : '4096';
+    const ex = EXAMPLES[b.dataset.ex] || { mode: 'compression', segs: [] };
+    for (let i = 1; i <= SEG_COUNT; i++) document.getElementById('seg' + i).value = ex.segs[i - 1] || '';
+    document.getElementById('mode').value = ex.mode;
+    document.getElementById('cap').value = '4096';
     clearResults();
   });
 });
@@ -157,6 +178,7 @@ function clearResults() { $status.innerHTML = ''; $blocks.innerHTML = ''; $concl
 document.getElementById('btnClearDraft').addEventListener('click', () => {
   for (let i = 1; i <= SEG_COUNT; i++) document.getElementById('seg' + i).value = '';
   document.getElementById('cap').value = '4096';
+  document.getElementById('mode').value = 'compression';
 });
 document.getElementById('btnClearAll').addEventListener('click', () => {
   document.getElementById('btnClearDraft').click();
@@ -247,11 +269,12 @@ document.getElementById('btnDecode').addEventListener('click', async () => {
   const segments = [];
   for (let i = 1; i <= SEG_COUNT; i++) segments.push(document.getElementById('seg' + i).value.trim());
   const capacity = Number(document.getElementById('cap').value);
+  const mode = document.getElementById('mode').value;
   let resp;
   try {
     resp = await fetch('/api/decode', {
       method: 'POST', headers: { 'content-type': 'application/json' },
-      body: JSON.stringify({ capacity, segments }),
+      body: JSON.stringify({ capacity, mode, segments }),
     });
   } catch (e) {
     $status.innerHTML = '<div class="alert err">网络错误：无法连接解码服务（' + esc(e.message) + '）</div>';
@@ -266,19 +289,27 @@ document.getElementById('btnDecode').addEventListener('click', async () => {
 
   if (!data.ok) {
     const e = data.error;
+    const strictNote = data.mode === 'strict'
+      ? '<div class="hint" style="color:#e6b3b3;margin-top:6px">该失败块<b>未提交</b>：此前各段快照原样保留，块内插入/驱逐/容量变更已全部回滚；不生成成功结论。严格模式下语义规则（伪首部顺序/数量、小写字段名、连接专用字段、te 取值）与 HPACK 解码规则同等对待。</div>'
+      : '<div class="hint" style="color:#e6b3b3;margin-top:6px">该失败块<b>未提交</b>：此前各段快照原样保留，块内插入/驱逐已全部回滚；不生成成功结论。</div>';
     // 验收要求：失败即清除“成功结论”
     $status.innerHTML = '<div class="alert err">⛔ <b>第 ' + e.block + ' 段解码失败</b>，已在段内字节偏移 ' +
       '<span class="off">' + e.offsetHex + '（十进制 ' + e.offset + '）</span>' +
       (e.byte ? '，该字节 <span class="off">' + e.byte + '</span>' : '') +
       ' 处检出 <span class="code">' + esc(e.code) + '</span>：' + esc(e.message) +
-      '<div class="hint" style="color:#e6b3b3;margin-top:6px">该失败块<b>未提交</b>：此前各段快照原样保留，块内插入/驱逐已全部回滚；不生成成功结论。</div></div>';
+      (e.rule ? '<div class="hint" style="color:#ffd9d9;margin-top:4px">裁决规则：' + esc(e.rule) + '</div>' : '') +
+      strictNote + '</div>';
     data.results.forEach((r) => $blocks.appendChild(renderBlock(r, false)));
     $blocks.appendChild(renderBlock({ block: e.block, rawLength: e.blockLength, fields: null, events: null, snapshot: null }, true));
     return;
   }
 
   const c = data.conclusion;
-  $status.innerHTML = '<div class="alert ok">✅ 全部 ' + data.results.length + ' 段连续解码成功，压缩上下文跨段一致，结论有效。</div>';
+  const modeText = data.mode === 'strict'
+    ? '严格请求头模式：全部段均满足 HTTP/2 请求头规则，'
+    : '仅压缩复核模式：任意合法 HPACK 字段链路，';
+  $status.innerHTML = '<div class="alert ok">✅ 全部 ' + data.results.length + ' 段连续解码成功，' + modeText +
+    '压缩上下文跨段一致，结论有效。</div>';
   let rows = c.allFields.map((f) =>
     '<tr><td>第 ' + f.block + ' 段</td><td class="mono">0x' + f.offset.toString(16) +
     '</td><td class="mono">' + esc(f.name) + '</td><td class="mono">' + esc(f.value) + '</td></tr>').join('');

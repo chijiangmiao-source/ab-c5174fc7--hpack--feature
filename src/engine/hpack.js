@@ -16,11 +16,12 @@ const HUFF_MIN = HUFF_LENGTHS[0];
 const HUFF_MAX = HUFF_LENGTHS[HUFF_LENGTHS.length - 1];
 
 class HPACKError extends Error {
-  constructor(code, offset, message) {
+  constructor(code, offset, message, rule = null) {
     super(message);
     this.name = 'HPACKError';
-    this.code = code;
+    this.code = code; // 规则机器码（HPACK 解码规则或 HTTP/2 请求头规则）
     this.offset = offset; // 块内字节偏移（出错元素的起始字节）
+    this.rule = rule; // 人类可读的规则出处（如 RFC 7540 §8.1.2.1）
   }
 }
 
@@ -255,17 +256,122 @@ function utf8Info(bytes) {
   return { text, valid, hex: bytes.toString('hex') };
 }
 
+// --- HTTP/2 请求头语义校验（RFC 7540 §8.1.2） --------------------------------
+// 仅严格模式启用。逐字段裁决，违规即在“首个违规字段”的起始字节抛错，
+// 由调用方连同该块已发生的动态表变更整体回滚。
+const REQUIRED_PSEUDO = [':method', ':scheme', ':path']; // 各恰有一次
+const CONNECTION_SPECIFIC = new Set([
+  // RFC 7540 §8.1.2.2 显式禁止的连接专用字段
+  'connection',
+  'keep-alive',
+  'proxy-connection',
+  'transfer-encoding',
+  'upgrade',
+  'te', // 唯一例外：值恰为 "trailers"
+]);
+
+class RequestHeaderValidator {
+  constructor() {
+    this.seenPseudo = new Set(); // 已出现的请求伪首部
+    this.regularStarted = false; // 是否已出现普通字段（伪首部不得再出现）
+  }
+
+  check(field) {
+    const start = field.offset;
+    const name = field.name;
+
+    if (name.length > 0 && name.charCodeAt(0) === 0x3a /* ':' */) {
+      // 伪首部：必须全部先于普通字段；且只允许请求侧伪首部
+      if (this.regularStarted) {
+        throw new HPACKError(
+          'PSEUDO_AFTER_REGULAR',
+          start,
+          `伪首部 ${name} 出现在普通字段之后（伪首部必须位于块首）`,
+          'RFC 7540 §8.1.2.1（伪首部必须先于普通字段）'
+        );
+      }
+      if (name !== ':method' && name !== ':scheme' && name !== ':path' && name !== ':authority') {
+        throw new HPACKError(
+          'PSEUDO_HEADER_UNKNOWN',
+          start,
+          `未知或非请求侧伪首部 ${name}`,
+          'RFC 7540 §8.1.2.1 / §8.1.2.3（请求仅允许 :method/:scheme/:path/:authority）'
+        );
+      }
+      if (this.seenPseudo.has(name)) {
+        throw new HPACKError(
+          'PSEUDO_HEADER_DUPLICATE',
+          start,
+          `伪首部 ${name} 在同一块中重复出现（各伪首部至多一次）`,
+          'RFC 7540 §8.1.2.3（同一伪首部不得重复）'
+        );
+      }
+      this.seenPseudo.add(name);
+      return;
+    }
+
+    // 进入普通字段区段
+    this.regularStarted = true;
+
+    // 字段名必须为小写（RFC 7540 §8.1.2 HTTP/2 名称一律小写，禁止大写）
+    for (let i = 0; i < name.length; i += 1) {
+      const cc = name.charCodeAt(i);
+      if (cc >= 0x41 && cc <= 0x5a) {
+        throw new HPACKError(
+          'HEADER_NAME_NOT_LOWERCASE',
+          start,
+          `字段名 "${name}" 含大写字母（HTTP/2 字段名必须为小写）`,
+          'RFC 7540 §8.1.2（字段名必须为小写）'
+        );
+      }
+    }
+
+    // 拒绝连接专用字段（RFC 7540 §8.1.2.2）；te 唯一例外值为 trailers
+    if (CONNECTION_SPECIFIC.has(name)) {
+      if (name === 'te' && field.value === 'trailers') return;
+      const detail =
+        name === 'te'
+          ? 'te 仅允许取 "trailers"'
+          : `${name} 是 HTTP/1.x 连接专用字段，禁止在 HTTP/2 请求中出现`;
+      throw new HPACKError(
+        'CONNECTION_SPECIFIC_HEADER',
+        start,
+        `字段 "${name}" 非法：${detail}`,
+        'RFC 7540 §8.1.2.2（禁止连接专用字段；te 仅允许 trailers）'
+      );
+    }
+  }
+
+  // 块解码结束后校验必需伪首部齐备；缺失时定位到块尾（无单一违规字段）
+  checkEnd(blockLength) {
+    for (const p of REQUIRED_PSEUDO) {
+      if (!this.seenPseudo.has(p)) {
+        throw new HPACKError(
+          'PSEUDO_HEADER_MISSING',
+          blockLength,
+          `请求头块缺少必需伪首部 ${p}`,
+          'RFC 7540 §8.1.2.3（:method/:scheme/:path 各恰有一次）'
+        );
+      }
+    }
+  }
+}
+
 // 解码单个 HP 块；成功返回 {fields, events}，调用方负责提交工作副本。
-function decodeBlock(block, table, maxCapacity) {
+// strict=true 时额外按 HTTP/2 请求头规则裁决（RFC 7540 §8.1.2）：
+// 语义失败与 HPACK 解码失败一样抛 HPACKError，且整块不提交。
+function decodeBlock(block, table, maxCapacity, strict = false) {
   const work = table.clone();
   const fields = [];
   const events = [];
+  const validator = strict ? new RequestHeaderValidator() : null;
   let offset = 0;
   let seenHeaderField = false;
 
   while (offset < block.length) {
     const start = offset;
     const b = block[offset];
+    const fieldCountBefore = fields.length;
 
     if (b & 0x80) {
       // 6.1 索引首部字段  1xxxxxxx
@@ -395,7 +501,15 @@ function decodeBlock(block, table, maxCapacity) {
       });
       offset = vs.offset;
     }
+
+    // 严格模式：每解出一个字段即按 HTTP/2 请求头规则裁决；
+    // 违规字段的起始字节即 start，抛错后工作副本由调用方整体丢弃。
+    if (validator && fields.length > fieldCountBefore) {
+      validator.check(fields[fields.length - 1]);
+    }
   }
+
+  if (validator) validator.checkEnd(block.length);
 
   return { work, fields, events };
 }
@@ -423,5 +537,6 @@ module.exports = {
   readInteger,
   readString,
   decodeHuffman,
+  RequestHeaderValidator,
   STATIC_COUNT,
 };

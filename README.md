@@ -1,6 +1,13 @@
 # 🛰️ 星载中继网关 · HPACK 连续头块复核台
 
 地面审查员可按接收顺序粘贴 **1–8 段 Base64 编码的原始 HPACK 头块**，设置动态表容量上限，
+并在容量旁选择复核模式：
+
+- **仅压缩复核**（默认）：只按 RFC 7541 裁决压缩层合法性，接受任意合法 HPACK 字段链路，
+  结果与快照与历史版本完全一致。
+- **严格请求头**：在压缩解码之外，对每个块解出的字段再按 **HTTP/2 请求头规则**
+  （RFC 7540 §8.1.2）裁决，避免表面可解码的字段被误作有效的遥测请求。
+
 逐段查看：
 
 - 每个还原字段（名称 / 值 / 段内字节偏移 / 表示类型）
@@ -30,6 +37,28 @@
 `RESIZE_EXCEEDS_CAPACITY`（容量更新超协商上限）、`FIELD_TOO_LARGE`（增量条目裸尺寸
 32+名长+值长超过当前容量）。
 
+### 严格请求头规则（仅严格模式，RFC 7540 §8.1.2）
+
+对每个块解出的字段按 HTTP/2 **请求头**规则逐字段裁决，首个违规字段即报：
+
+- **伪首部先于普通字段**：普通字段之后再出现伪首部 → `PSEUDO_AFTER_REGULAR`
+- **请求伪首部白名单**：仅允许 `:method`、`:scheme`、`:path`、`:authority`，
+  其余（如响应侧 `:status`）→ `PSEUDO_HEADER_UNKNOWN`
+- **`:method`、`:scheme`、`:path` 各恰有一次**：重复 → `PSEUDO_HEADER_DUPLICATE`，
+  块末仍缺失 → `PSEUDO_HEADER_MISSING`
+- **字段名保持小写**：含大写字母 → `HEADER_NAME_NOT_LOWERCASE`
+- **拒绝连接专用字段**（`connection`、`keep-alive`、`proxy-connection`、
+  `transfer-encoding`、`upgrade`）与值不为 `trailers` 的 `te`
+  → `CONNECTION_SPECIFIC_HEADER`（`te: trailers` 放行）
+
+每个语义错误同样返回**块号、块内字节偏移（首个违规字段起始字节）、规则出处 `rule`
+（如 `RFC 7540 §8.1.2.1`）**。该块中已发生的动态表插入、驱逐或容量变更**一律不提交**
+（与 HPACK 解码失败同口径回滚），此前各段快照原样保留，响应不携带成功结论。
+
+> 每个块独立裁决伪首部齐备性，因此严格模式下**后块引用前块插入字段仍可通过**——
+> 后块只需自带 `:method/:scheme/:path`，即可用动态索引引用前块插入的普通字段。
+> 仅压缩复核模式不做任何上述语义裁决，历史任意合法 HPACK 链路的结果与快照保持不变。
+
 失败块在**工作副本**上解码，任何插入/驱逐/容量变更都随异常整体丢弃；
 已提交的各段快照原样保留，且响应不携带成功结论（页面同步清除旧结论）。
 
@@ -51,11 +80,14 @@ PORT=9000 node src/server.js
 - `POST /api/decode` 请求体：
   ```json
   { "capacity": 4096,
+    "mode": "compression",
     "segments": ["<第1段base64>", "<第2段base64>", "...共8槽，空槽可省略"] }
   ```
-  成功返回 `200 { ok:true, results:[...], conclusion:{...} }`；
-  块级规则错误返回 `422 { ok:false, error:{ block, code, offset, offsetHex, byte, message } }`；
-  输入错误（Base64、容量、段数、总量）返回 `400`。
+  `mode` 取 `compression`（仅压缩复核，缺省）或 `strict`（严格 HTTP/2 请求头裁决）。
+  成功返回 `200 { ok:true, mode, results:[...], conclusion:{...} }`；
+  块级规则错误返回 `422 { ok:false, error:{ block, code, offset, offsetHex, byte, rule, message } }`
+  （严格模式语义错误额外带 `rule` 规则出处）；
+  输入错误（Base64、容量、模式、段数、总量）返回 `400`。
 
 ## Compose
 
@@ -68,8 +100,9 @@ docker compose run --rm verify        # 验收入口（对 app 服务冒烟）
 
 1. 连续解码规则代码测试（`node --test test/`）
 2. 页面构建检查（8 段输入、容量设置、清空按钮、渲染逻辑、内联脚本语法）
-3. 对页面、健康路径与解码 API 的 HTTP/API 冒烟（含“后块引用前块插入字段”与
-   “非法后续块不污染已提交表状态”两条验收主线）
+3. 对页面、健康路径与解码 API 的 HTTP/API 冒烟（含“后块引用前块插入字段”、
+   “非法后续块不污染已提交表状态”，以及严格模式“有效严格请求”“伪首部顺序错误回滚”、
+   兼容模式仍成功解码三条验收主线）
 
 完成后退出，退出码 `0` 全绿、非 `0` 有失败项。无 Docker 时也可直接 `npm run verify`
 （会在随机端口本机拉起应用再冒烟）。
@@ -77,7 +110,7 @@ docker compose run --rm verify        # 验收入口（对 app 服务冒烟）
 ## 测试
 
 ```bash
-npm test        # 35 项规则单测（含 RFC 7541 附录 C.4.1 权威向量）
+npm test        # 54 项规则单测（含 RFC 7541 附录 C.4.1 权威向量与严格请求头规则）
 npm run verify  # 测试 + 页面检查 + HTTP/API 冒烟
 ```
 

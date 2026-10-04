@@ -18,14 +18,20 @@ class InputError extends Error {
 }
 
 class SegmentedDecoder {
-  constructor(maxCapacity = MAX_CAPACITY) {
+  // mode: 'compression'（仅压缩复核，默认）或 'strict'（严格 HTTP/2 请求头裁决）
+  constructor(maxCapacity = MAX_CAPACITY, mode = 'compression') {
     if (!Number.isInteger(maxCapacity) || maxCapacity < 0 || maxCapacity > MAX_CAPACITY) {
       throw new InputError(
         'CAPACITY_INVALID',
         `动态表容量上限必须是 0..${MAX_CAPACITY} 之间的整数`
       );
     }
+    if (mode !== 'compression' && mode !== 'strict') {
+      throw new InputError('MODE_INVALID', "复核模式必须是 compression（仅压缩复核）或 strict（严格请求头）");
+    }
     this.maxCapacity = maxCapacity;
+    this.mode = mode;
+    this.strict = mode === 'strict';
     this.table = new DynamicTable(maxCapacity); // 已提交表状态
     this.results = []; // 仅含成功提交的段
     this.totalBytes = 0;
@@ -43,8 +49,9 @@ class SegmentedDecoder {
       );
     }
 
-    // 解码全程在工作副本上进行；只有完整成功才提交。
-    const { work, fields, events } = decodeBlock(raw, this.table, this.maxCapacity);
+    // 解码全程在工作副本上进行；只有完整成功（含严格模式语义裁决）才提交。
+    // 严格模式下语义失败同样抛 HPACKError，块内插入/驱逐/容量变更全部丢弃。
+    const { work, fields, events } = decodeBlock(raw, this.table, this.maxCapacity, this.strict);
     this.table = work;
     this.totalBytes += raw.length;
 

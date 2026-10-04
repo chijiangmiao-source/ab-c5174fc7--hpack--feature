@@ -434,3 +434,150 @@ test('Huffman：空 Huffman 串合法（编码后 0 字节）', () => {
   assert.equal(r.fields[0].name, '');
   assert.equal(r.fields[0].value, '');
 });
+
+// --- 严格请求头模式（RFC 7540 §8.1.2） ------------------------------------------
+const STRICT_BLOCK1 = Buffer.from('goaEQBF4LXRlbGVtZXRyeS1yb3V0ZQpzYXQtYS90bS83', 'base64');
+const STRICT_BLOCK2 = Buffer.from('goaEvg==', 'base64'); // 三伪首部 + 动态索引 62
+const STRICT_BAD_ORDER = Buffer.from('QANmb28DYmFygg==', 'base64'); // foo=bar 后再 :method
+
+test('严格模式：合法请求块（三伪首部 + 普通字段）通过', () => {
+  const sd = new SegmentedDecoder(4096, 'strict');
+  const r = sd.addBlock(STRICT_BLOCK1);
+  assert.equal(r.fields[0].name, ':method');
+  assert.equal(r.fields[3].name, 'x-telemetry-route');
+  assert.equal(sd.conclusion().totalFields, 4);
+});
+
+test('严格模式：后块引用前块插入字段仍可通过（每块自带伪首部）', () => {
+  const sd = new SegmentedDecoder(4096, 'strict');
+  sd.addBlock(STRICT_BLOCK1);
+  const r2 = sd.addBlock(STRICT_BLOCK2);
+  assert.equal(r2.fields[3].name, 'x-telemetry-route');
+  assert.equal(r2.fields[3].source.location, 'dynamic');
+  assert.equal(r2.fields[3].source.index, 62);
+  assert.equal(sd.conclusion().blocks, 2);
+});
+
+test('严格模式：伪首部出现在普通字段之后 -> PSEUDO_AFTER_REGULAR，定位首个违规字段', () => {
+  const sd = new SegmentedDecoder(4096, 'strict');
+  try {
+    sd.addBlock(STRICT_BAD_ORDER);
+    assert.fail('应当抛错');
+  } catch (e) {
+    assert.equal(e.code, 'PSEUDO_AFTER_REGULAR');
+    assert.equal(e.offset, 9); // :method 索引字节在块内偏移 9
+    assert.match(e.rule, /RFC 7540/);
+  }
+});
+
+test('严格模式回滚：伪首部顺序错误块内插入不提交，旧结论保留', () => {
+  const sd = new SegmentedDecoder(4096, 'strict');
+  sd.addBlock(STRICT_BLOCK1);
+  const before = JSON.stringify(buildSnapshot(sd.table));
+  assert.throws(() => sd.addBlock(STRICT_BAD_ORDER));
+  assert.equal(JSON.stringify(buildSnapshot(sd.table)), before); // foo=bar 未提交
+  assert.equal(sd.results.length, 1);
+  // 失败块之后，下一个合法严格块仍可引用块1插入项
+  const r3 = sd.addBlock(STRICT_BLOCK2);
+  assert.equal(r3.fields[3].source.index, 62);
+});
+
+test('严格模式：缺少 :scheme -> PSEUDO_HEADER_MISSING', () => {
+  const sd = new SegmentedDecoder(4096, 'strict');
+  assert.throws(
+    () => sd.addBlock(hex('82')), // 仅 :method GET
+    (e) => e instanceof HPACKError && e.code === 'PSEUDO_HEADER_MISSING'
+  );
+});
+
+test('严格模式：重复 :method -> PSEUDO_HEADER_DUPLICATE', () => {
+  const sd = new SegmentedDecoder(4096, 'strict');
+  try {
+    sd.addBlock(hex('82 82 86 84'));
+    assert.fail();
+  } catch (e) {
+    assert.equal(e.code, 'PSEUDO_HEADER_DUPLICATE');
+    assert.equal(e.offset, 1);
+  }
+});
+
+test('严格模式：大写字段名 -> HEADER_NAME_NOT_LOWERCASE', () => {
+  const sd = new SegmentedDecoder(4096, 'strict');
+  // 三伪首部 + 不索引字面量 X-Custom: v
+  const block = Buffer.from('goaEAAhYLUN1c3RvbQF2', 'base64');
+  try {
+    sd.addBlock(block);
+    assert.fail();
+  } catch (e) {
+    assert.equal(e.code, 'HEADER_NAME_NOT_LOWERCASE');
+    assert.equal(e.offset, 3);
+  }
+});
+
+test('严格模式：拒绝 connection 连接专用字段', () => {
+  const sd = new SegmentedDecoder(4096, 'strict');
+  const block = Buffer.from('goaEAApjb25uZWN0aW9uBWNsb3Nl', 'base64'); // connection: close
+  assert.throws(
+    () => sd.addBlock(block),
+    (e) => e instanceof HPACKError && e.code === 'CONNECTION_SPECIFIC_HEADER'
+  );
+});
+
+test('严格模式：te=trailers 放行，te 取其他值拒绝', () => {
+  const sd1 = new SegmentedDecoder(4096, 'strict');
+  const r = sd1.addBlock(Buffer.from('goaEAAJ0ZQh0cmFpbGVycw==', 'base64'));
+  assert.equal(r.fields.at(-1).name, 'te');
+  assert.equal(r.fields.at(-1).value, 'trailers');
+
+  const sd2 = new SegmentedDecoder(4096, 'strict');
+  assert.throws(
+    () => sd2.addBlock(Buffer.from('goaEAAJ0ZQF4', 'base64')), // te: x
+    (e) => e instanceof HPACKError && e.code === 'CONNECTION_SPECIFIC_HEADER'
+  );
+});
+
+test('严格模式：transfer-encoding / upgrade 等连接专用字段一律拒绝', () => {
+  const lit = (n, v) => {
+    const nb = Buffer.from(n);
+    const vb = Buffer.from(v);
+    return Buffer.concat([hex('00'), Buffer.from([nb.length]), nb, Buffer.from([vb.length]), vb]);
+  };
+  for (const n of ['transfer-encoding', 'upgrade', 'keep-alive', 'proxy-connection']) {
+    const sd = new SegmentedDecoder(4096, 'strict');
+    const block = Buffer.concat([hex('82 86 84'), lit(n, 'x')]);
+    assert.throws(
+      () => sd.addBlock(block),
+      (e) => e instanceof HPACKError && e.code === 'CONNECTION_SPECIFIC_HEADER',
+      `${n} 应被拒绝`
+    );
+  }
+});
+
+test('仅压缩复核模式：不含伪首部的任意合法链路行为与快照保持不变', () => {
+  // 现有 cross 场景在 compression 下成功，strict 下因缺伪首部失败
+  const seg1 = Buffer.from('QBF4LXRlbGVtZXRyeS1yb3V0ZQpzYXQtYS90bS83', 'base64');
+  const seg2 = Buffer.from('vg==', 'base64');
+
+  const compat = new SegmentedDecoder(4096, 'compression');
+  compat.addBlock(seg1);
+  const r2 = compat.addBlock(seg2);
+  assert.equal(r2.fields[0].source.location, 'dynamic');
+  assert.equal(compat.conclusion().totalFields, 2);
+
+  const strict = new SegmentedDecoder(4096, 'strict');
+  assert.throws(() => strict.addBlock(seg1), (e) => e.code === 'PSEUDO_HEADER_MISSING');
+});
+
+test('严格模式：空块因缺少必需伪首部失败（语义裁决）', () => {
+  const sd = new SegmentedDecoder(4096, 'strict');
+  assert.throws(() => sd.addBlock(Buffer.alloc(0)), (e) => e.code === 'PSEUDO_HEADER_MISSING');
+});
+
+test('严格模式：未知/非请求侧伪首部（如 :status）拒绝', () => {
+  const sd = new SegmentedDecoder(4096, 'strict');
+  // 不索引字面量 :status / 200
+  const block = Buffer.concat([
+    hex('00 07'), Buffer.from(':status'), hex('03'), Buffer.from('200'),
+  ]);
+  assert.throws(() => sd.addBlock(block), (e) => e.code === 'PSEUDO_HEADER_UNKNOWN');
+});
